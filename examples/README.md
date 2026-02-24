@@ -1,8 +1,4 @@
-# Examples for Wayland Scanner for Odin
-
-This directory contains example programs demonstrating usage of the generated Wayland bindings.
-
-## Examples
+# Examples
 
 - `simple-window`: Creates a basic Wayland window using `xdg-shell`.
 - `clipboard-monitor`: Monitors for clipboard changes using `data-control`.
