@@ -1,0 +1,23 @@
+{
+	"collections": [
+		{
+			"name": "wayland",
+			"path": "."
+		}
+	],
+	"checker_args": "-collection:wayland=.",
+	"profile": "default",
+	"profiles": [
+		{
+			"name": "default",
+			"checker_path": [
+				"scanner",
+				"examples/simple-window",
+				"examples/clipboard-monitor",
+				"wayland",
+				"wayland/stable/xdg-shell",
+				"wayland/staging/ext-data-control"
+			]
+		}
+	]
+}
