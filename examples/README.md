@@ -1,6 +1,6 @@
 # Examples
 
-- `simple-window`: Creates a basic Wayland window using `xdg-shell`.
+- `simple-shm`: Creates a basic Wayland window using `xdg-shell`.
 - `clipboard-monitor`: Monitors for clipboard changes using `data-control`.
 
 ## Building and Running
@@ -15,13 +15,13 @@ From the project root:
 ./build-examples.sh
 
 # 3) Run examples
-./examples/bin/simple-window
+./examples/bin/simple-shm
 ./examples/bin/clipboard-monitor
 ```
 
 Or run directly without keeping binaries:
 
 ```bash
-odin run examples/simple-window -collection:wayland=.
+odin run examples/simple-shm -collection:wayland=.
 odin run examples/clipboard-monitor -collection:wayland=.
 ```

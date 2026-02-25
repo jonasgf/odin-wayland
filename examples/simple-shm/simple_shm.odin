@@ -1,4 +1,4 @@
-package simple_window
+package simple_shm
 
 import "base:runtime"
 import "core:c/libc"
@@ -41,6 +41,7 @@ import xdg "wayland:wayland/stable/xdg-shell"
 
 KEY_ESC :: 1
 KEY_Q :: 16
+KEY_F11 :: 87
 
 MAX_BUFFER_ALLOC :: 2
 
@@ -340,6 +341,20 @@ keyboard_key :: proc "c" (
 	key: u32,
 	state: wl.Keyboard_Key_State,
 ) {
+	window := active_window
+	if window == nil {
+		return
+	}
+
+	if key == KEY_F11 && state == .Pressed {
+		if window.fullscreen {
+			xdg.toplevel_unset_fullscreen(window.xdg_toplevel)
+		} else {
+			xdg.toplevel_set_fullscreen(window.xdg_toplevel, nil)
+		}
+		return
+	}
+
 	if (key == KEY_ESC || key == KEY_Q) && state == .Pressed {
 		running = false
 	}

@@ -12,7 +12,7 @@
 			"name": "default",
 			"checker_path": [
 				"scanner",
-				"examples/simple-window",
+				"examples/simple-shm",
 				"examples/clipboard-monitor",
 				"wayland",
 				"wayland/stable/xdg-shell",
