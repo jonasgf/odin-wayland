@@ -4,7 +4,6 @@ This project provides a scanner to generate Wayland client bindings for the Odin
 
 ## Prerequisites
 
-- **Odin Compiler**: [odin-lang.org](https://odin-lang.org)
 - **Wayland Protocols**: XML files (e.g `/usr/share/wayland/wayland.xml`, `/usr/share/wayland-protocols/*.xml`).
 - **pkg-config** (optional): Used by the generate script to detect the Wayland and Wayland protocols directories.
 
