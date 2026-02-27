@@ -40,7 +40,7 @@ odin build -collection:wayland=/path/to/odin-wayland
 ./build-examples.sh
 ```
 
-Binaries are put in `./examples/bin/`. The script runs `./generate.sh` first.
+Binaries are put in `./examples/bin/`.
 
 Direct scanner invocation:
 

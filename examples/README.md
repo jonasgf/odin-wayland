@@ -11,7 +11,7 @@ From the project root:
 # 1) Generate bindings
 ./generate.sh
 
-# 2) Build all examples into examples/bin/
+# 2) Build examples
 ./build-examples.sh
 
 # 3) Run examples
