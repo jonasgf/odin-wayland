@@ -33,7 +33,7 @@ run_scanner() {
 	output_file="$2"
 	package_name="${3:-}"
 	mkdir -p "$(dirname "$OUTPUT_DIR/$output_file")"
-	echo "$input_file -> $output_file"
+	echo "$input_file"
 	if [ -n "$package_name" ]; then
 		"$SCANNER_BIN" "$input_file" "$OUTPUT_DIR/$output_file" "-package=$package_name"
 	else
