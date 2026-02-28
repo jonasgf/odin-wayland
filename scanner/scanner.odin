@@ -5,6 +5,7 @@ import "core:encoding/xml"
 import "core:flags"
 import "core:fmt"
 import os "core:os/os2"
+import "core:path/filepath"
 import "core:slice"
 import "core:strings"
 import "core:unicode"
@@ -40,13 +41,14 @@ Description :: struct {
 }
 
 Protocol :: struct {
-	name:               string,
-	copyright:          string,
-	description:        Description,
-	interfaces:         [dynamic]^Interface,
-	external_imports:   map[string]string,
-	null_run_length:    int,
-	type_index_counter: int,
+	name:                string,
+	copyright:           string,
+	description:         Description,
+	interfaces:          [dynamic]^Interface,
+	external_imports:    map[string]string,
+	wayland_import_path: string,
+	null_run_length:     int,
+	type_index_counter:  int,
 }
 
 Interface :: struct {
@@ -157,7 +159,6 @@ Scanner_Options :: struct {
 DEFAULT_OUTPUT_DIR :: "wayland"
 DEFAULT_WAYLAND_XML_PATH :: "/usr/share/wayland/wayland.xml"
 DEFAULT_WAYLAND_PROTOCOLS_DIR :: "/usr/share/wayland-protocols"
-DEFAULT_IMPORT_BASE :: "wayland:wayland"
 
 main :: proc() {
 	options: Scanner_Options
@@ -189,7 +190,6 @@ generate_all_protocols :: proc(options: ^Scanner_Options) -> bool {
 	registry_sources, sources_ok := collect_registry_sources(
 		registry_xml[:],
 		[]string{options.protocols_dir},
-		DEFAULT_IMPORT_BASE,
 	)
 	if !sources_ok {
 		return false
@@ -381,7 +381,6 @@ parse_protocol :: proc(doc: ^xml.Document) -> (protocol: ^Protocol, ok: bool) {
 collect_registry_sources :: proc(
 	registry_xml: []string,
 	registry_dir: []string,
-	import_base: string,
 ) -> (
 	sources: [dynamic]Registry_Source,
 	ok: bool,
@@ -399,7 +398,7 @@ collect_registry_sources :: proc(
 		if !path_ok {
 			return
 		}
-		import_path := derive_import_path_for_registry_xml(abs_path, import_base)
+		import_path := derive_import_path_for_registry_xml(abs_path)
 		import_clone, import_ok := clone_string_or_report(import_path, "registry import path")
 		if !import_ok {
 			return
@@ -409,7 +408,7 @@ collect_registry_sources :: proc(
 	}
 
 	for dir_path in registry_dir {
-		dir_sources, dir_ok := collect_xml_files_from_directory(dir_path, import_base)
+		dir_sources, dir_ok := collect_xml_files_from_directory(dir_path)
 		if !dir_ok {
 			return
 		}
@@ -466,7 +465,6 @@ add_registry_source :: proc(
 
 collect_xml_files_from_directory :: proc(
 	dir_path: string,
-	import_base: string,
 ) -> (
 	sources: [dynamic]Registry_Source,
 	ok: bool,
@@ -508,7 +506,7 @@ collect_xml_files_from_directory :: proc(
 		if !xml_ok {
 			return
 		}
-		import_path := import_path_from_registry_relative(import_base, relative_path)
+		import_path := import_path_from_registry_relative(relative_path)
 		import_clone, import_ok := clone_string_or_report(import_path, "registry import path")
 		if !import_ok {
 			return
@@ -525,23 +523,23 @@ collect_xml_files_from_directory :: proc(
 	return sources, true
 }
 
-import_path_from_registry_relative :: proc(import_base: string, relative_path: string) -> string {
+import_path_from_registry_relative :: proc(relative_path: string) -> string {
 	clean_relative := normalize_import_segment(relative_path)
 	dir, _ := os.split_path(clean_relative)
 	if dir == "" || dir == "." {
-		return import_base
+		return ""
 	}
 	if dir[len(dir) - 1] == '/' {
 		dir = dir[:len(dir) - 1]
 	}
-	return fmt.aprintf("%v/%v", import_base, dir)
+	return dir
 }
 
-derive_import_path_for_registry_xml :: proc(xml_path: string, import_base: string) -> string {
+derive_import_path_for_registry_xml :: proc(xml_path: string) -> string {
 	clean_path := normalize_import_segment(xml_path)
 	_, file_name := os.split_path(clean_path)
 	if file_name == "wayland.xml" {
-		return import_base
+		return ""
 	}
 
 	protocol_class_paths := [3]string{"/stable/", "/staging/", "/unstable/"}
@@ -549,17 +547,63 @@ derive_import_path_for_registry_xml :: proc(xml_path: string, import_base: strin
 		start := strings.index(clean_path, class_path)
 		if start >= 0 {
 			relative := clean_path[start + 1:]
-			return import_path_from_registry_relative(import_base, relative)
+			return import_path_from_registry_relative(relative)
 		}
 	}
 
 	if strings.has_prefix(clean_path, "stable/") ||
 	   strings.has_prefix(clean_path, "staging/") ||
 	   strings.has_prefix(clean_path, "unstable/") {
-		return import_path_from_registry_relative(import_base, clean_path)
+		return import_path_from_registry_relative(clean_path)
 	}
 
 	return ""
+}
+
+relative_import_path :: proc(
+	current_import_path: string,
+	target_import_path: string,
+) -> (
+	relative_path: string,
+	ok: bool,
+) {
+	base_os, base_new := filepath.from_slash(current_import_path)
+	if base_new {
+		defer delete(base_os)
+	}
+
+	target_os, target_new := filepath.from_slash(target_import_path)
+	if target_new {
+		defer delete(target_os)
+	}
+
+	rel_os, rel_err := filepath.rel(base_os, target_os)
+	if rel_err != .None {
+		fmt.eprintfln(
+			"Failed to compute relative import path from '%v' to '%v': %v",
+			current_import_path,
+			target_import_path,
+			rel_err,
+		)
+		return
+	}
+	defer delete(rel_os)
+
+	rel_slash, rel_slash_new := filepath.to_slash(rel_os)
+	if rel_slash_new {
+		defer delete(rel_slash)
+	}
+
+	normalized := rel_slash
+	if strings.has_suffix(normalized, "/.") && len(normalized) > 2 {
+		normalized = normalized[:len(normalized) - 2]
+	}
+	if normalized == "" {
+		normalized = "."
+	}
+
+	relative_path, ok = clone_string_or_report(normalized, "relative import path")
+	return
 }
 
 normalize_import_segment :: proc(raw: string) -> string {
@@ -1045,7 +1089,7 @@ emit_protocol_imports :: proc(ctx: ^Emit_Context, protocol: ^Protocol) {
 	}
 
 	emitln(ctx, "import \"core:c\"")
-	emitln(ctx, "import wl \"wayland:wayland\"")
+	emitln(ctx, "import wl \"%v\"", protocol.wayland_import_path)
 
 	if len(protocol.external_imports) > 0 {
 		aliases: [dynamic]string
@@ -2531,7 +2575,12 @@ resolve_interface_reference :: proc(
 		return "", "", false
 	}
 
-	record_external_import(required_imports, owner.alias, owner.import_path, source) or_return
+	import_path, import_ok := relative_import_path(resolution.import_path, owner.import_path)
+	if !import_ok {
+		return "", "", false
+	}
+
+	record_external_import(required_imports, owner.alias, import_path, source) or_return
 	return fmt.aprintf("%v.", owner.alias), owner.short_name, true
 }
 
@@ -2593,10 +2642,18 @@ resolve_enumeration_reference :: proc(
 				return "", "", false, false, false
 			}
 
+			import_path, import_ok := relative_import_path(
+				resolution.import_path,
+				owner.import_path,
+			)
+			if !import_ok {
+				return "", "", false, false, false
+			}
+
 			record_external_import(
 				required_imports,
 				owner.alias,
-				owner.import_path,
+				import_path,
 				external_source,
 			) or_return
 
@@ -2899,6 +2956,15 @@ finalize_protocol :: proc(
 	protocol.type_index_counter = 0
 	protocol.external_imports = make(map[string]string)
 	resolution := build_resolution_context(protocol, registry, source_xml_path)
+	if protocol.name == "wayland" {
+		protocol.wayland_import_path = "."
+	} else {
+		wayland_import_path, wayland_ok := relative_import_path(resolution.import_path, "")
+		if !wayland_ok {
+			return false
+		}
+		protocol.wayland_import_path = wayland_import_path
+	}
 
 	for interface in protocol.interfaces {
 		for request in interface.requests {
