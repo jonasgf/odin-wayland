@@ -28,30 +28,7 @@ fi
 
 odin build "$SCANNER_SRC" -out:"$SCANNER_BIN"
 
-run_scanner() {
-	input_file="$1"
-	output_file="$2"
-	package_name="${3:-}"
-	mkdir -p "$(dirname "$OUTPUT_DIR/$output_file")"
-	echo "$input_file"
-	if [ -n "$package_name" ]; then
-		"$SCANNER_BIN" "$input_file" "$OUTPUT_DIR/$output_file" "-package=$package_name"
-	else
-		"$SCANNER_BIN" "$input_file" "$OUTPUT_DIR/$output_file"
-	fi
-}
-
-run_scanner "$WAYLAND_XML" "wayland.odin" "wayland"
-
-for protocol_class in stable staging unstable; do
-	class_dir="$WAYLAND_PROTOCOLS_DIR/$protocol_class"
-	if [ ! -d "$class_dir" ]; then
-		continue
-	fi
-
-	find "$class_dir" -type f -name "*.xml" | sort | while read -r xml_file; do
-		relative_path="${xml_file#$WAYLAND_PROTOCOLS_DIR/}"
-		output_file="${relative_path%.xml}.odin"
-		run_scanner "$xml_file" "$output_file"
-	done
-done
+"$SCANNER_BIN" \
+	"-output-dir=$OUTPUT_DIR" \
+	"-wayland-xml=$WAYLAND_XML" \
+	"-protocols-dir=$WAYLAND_PROTOCOLS_DIR"

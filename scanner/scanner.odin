@@ -1,9 +1,11 @@
 package scanner
 
+import "base:runtime"
 import "core:encoding/xml"
 import "core:flags"
 import "core:fmt"
 import os "core:os/os2"
+import "core:slice"
 import "core:strings"
 import "core:unicode"
 
@@ -20,6 +22,7 @@ Argument_Type :: enum {
 
 Argument :: struct {
 	name:                 string,
+	name_odin:            string,
 	type:                 Argument_Type,
 	nullable:             bool,
 	enumeration_name:     string,
@@ -41,6 +44,7 @@ Protocol :: struct {
 	copyright:          string,
 	description:        Description,
 	interfaces:         [dynamic]^Interface,
+	external_imports:   map[string]string,
 	null_run_length:    int,
 	type_index_counter: int,
 }
@@ -99,44 +103,230 @@ Emit_Context :: struct {
 	wayland_prefix:  string,
 }
 
+Registry_Source :: struct {
+	xml_path:    string,
+	import_path: string,
+}
+
+Protocol_Metadata :: struct {
+	name:               string,
+	xml_path:           string,
+	import_path:        string,
+	module_name:        string,
+	alias:              string,
+	interface_names:    [dynamic]string,
+	imported_protocols: [dynamic]string,
+}
+
+Interface_Owner :: struct {
+	full_interface_name: string,
+	protocol_name:       string,
+	import_path:         string,
+	module_name:         string,
+	alias:               string,
+	short_name:          string,
+	xml_path:            string,
+}
+
+Interface_Registry :: struct {
+	owners:            map[string][dynamic]Interface_Owner,
+	protocols_by_path: map[string]Protocol_Metadata,
+}
+
+Resolution_Context :: struct {
+	protocol_name:      string,
+	import_path:        string,
+	module_name:        string,
+	imported_protocols: []string,
+}
+
+Reference_Source :: struct {
+	protocol_name:        string,
+	interface_full_name:  string,
+	message_name:         string,
+	argument_name:        string,
+	referenced_interface: string,
+}
+
+Scanner_Options :: struct {
+	output_dir:    string `args:"name=output-dir" usage:"Output directory for generated bindings."`,
+	wayland_xml:   string `args:"name=wayland-xml" usage:"Path to wayland.xml."`,
+	protocols_dir: string `args:"name=protocols-dir" usage:"Path to wayland-protocols root."`,
+}
+
+DEFAULT_OUTPUT_DIR :: "wayland"
+DEFAULT_WAYLAND_XML_PATH :: "/usr/share/wayland/wayland.xml"
+DEFAULT_WAYLAND_PROTOCOLS_DIR :: "/usr/share/wayland-protocols"
+DEFAULT_IMPORT_BASE :: "wayland:wayland"
+
 main :: proc() {
-	options: struct {
-		input_file:   string `args:"pos=0,required" usage:"Input protocol XML file."`,
-		output_file:  string `args:"pos=1,required" usage:"Output Odin file."`,
-		package_name: string `args:"name=package" usage:"Package name. Defaults to protocol name from XML."`,
-	}
+	options: Scanner_Options
 	flags.parse_or_exit(&options, os.args)
 
-	doc, xml_err := xml.load_from_file(options.input_file)
-	if xml_err != .None {
-		fmt.eprintfln("Failed to load XML file: %v", xml_err)
+	if options.output_dir == "" {
+		options.output_dir = DEFAULT_OUTPUT_DIR
+	}
+	if options.wayland_xml == "" {
+		options.wayland_xml = DEFAULT_WAYLAND_XML_PATH
+	}
+	if options.protocols_dir == "" {
+		options.protocols_dir = DEFAULT_WAYLAND_PROTOCOLS_DIR
+	}
+
+	if !generate_all_protocols(&options) {
 		os.exit(1)
 	}
-	defer xml.destroy(doc)
+}
 
-	protocol, protocol_ok := parse_protocol(doc)
-	if !protocol_ok {
-		fmt.eprintln("Failed to parse protocol.")
-		os.exit(1)
-	}
+Generation_Target :: struct {
+	source:      Registry_Source,
+	output_file: string,
+}
 
-	package_name := options.package_name
-	if package_name == "" {
-		package_name = protocol.name
-	}
-
-	output_file, open_err := os.open(
-		options.output_file,
-		{.Create, .Trunc, .Write},
-		os.Permissions_Default_File,
+generate_all_protocols :: proc(options: ^Scanner_Options) -> bool {
+	registry_xml: [dynamic]string
+	append(&registry_xml, options.wayland_xml)
+	registry_sources, sources_ok := collect_registry_sources(
+		registry_xml[:],
+		[]string{options.protocols_dir},
+		DEFAULT_IMPORT_BASE,
 	)
+	if !sources_ok {
+		return false
+	}
+
+	interface_registry, registry_ok := build_interface_registry(registry_sources[:])
+	if !registry_ok {
+		return false
+	}
+
+	targets, targets_ok := build_generation_targets(
+		registry_sources[:],
+		options.output_dir,
+		options.wayland_xml,
+		options.protocols_dir,
+	)
+	if !targets_ok {
+		return false
+	}
+
+	for target in targets {
+		doc, protocol, protocol_ok := parse_protocol_file(target.source.xml_path)
+		if !protocol_ok {
+			return false
+		}
+
+		if !finalize_protocol(protocol, &interface_registry, target.source.xml_path) {
+			xml.destroy(doc)
+			return false
+		}
+
+		fmt.printfln("%v", target.source.xml_path)
+		if !emit_protocol_to_file(target.output_file, protocol, protocol.name) {
+			xml.destroy(doc)
+			return false
+		}
+		xml.destroy(doc)
+	}
+
+	return true
+}
+
+build_generation_targets :: proc(
+	sources: []Registry_Source,
+	output_dir: string,
+	wayland_xml: string,
+	protocols_dir: string,
+) -> (
+	targets: [dynamic]Generation_Target,
+	ok: bool,
+) {
+	abs_wayland_xml, wayland_err := os.get_absolute_path(wayland_xml, context.temp_allocator)
+	if wayland_err != nil {
+		fmt.eprintfln("Failed to resolve wayland XML path '%v': %v", wayland_xml, wayland_err)
+		return
+	}
+
+	abs_protocols_dir, protocols_err := os.get_absolute_path(protocols_dir, context.temp_allocator)
+	if protocols_err != nil {
+		fmt.eprintfln(
+			"Failed to resolve protocols directory '%v': %v",
+			protocols_dir,
+			protocols_err,
+		)
+		return
+	}
+
+	for source in sources {
+		target := Generation_Target {
+			source = source,
+		}
+
+		if source.xml_path == abs_wayland_xml {
+			target.output_file = fmt.aprintf("%v/wayland.odin", output_dir)
+		} else {
+			relative, relative_err := os.get_relative_path(
+				abs_protocols_dir,
+				source.xml_path,
+				context.temp_allocator,
+			)
+			if relative_err != nil {
+				fmt.eprintfln(
+					"Registry source '%v' is not under protocols directory '%v': %v",
+					source.xml_path,
+					abs_protocols_dir,
+					relative_err,
+				)
+				return
+			}
+
+			relative, _ = strings.replace_all(relative, ".xml", ".odin")
+			target.output_file = fmt.aprintf("%v/%v", output_dir, relative)
+		}
+
+		append(&targets, target)
+	}
+
+	return targets, true
+}
+
+parse_protocol_file :: proc(path: string) -> (doc: ^xml.Document, protocol: ^Protocol, ok: bool) {
+	loaded_doc, xml_err := xml.load_from_file(path)
+	if xml_err != .None {
+		fmt.eprintfln("Failed to load XML file '%v': %v", path, xml_err)
+		return
+	}
+	doc = loaded_doc
+
+	protocol, ok = parse_protocol(doc)
+	if !ok {
+		fmt.eprintfln("Failed to parse protocol from '%v'.", path)
+		xml.destroy(doc)
+		return nil, nil, false
+	}
+	return doc, protocol, true
+}
+
+emit_protocol_to_file :: proc(path: string, protocol: ^Protocol, package_name: string) -> bool {
+	dir_path, _ := os.split_path(path)
+	if dir_path != "" && dir_path != "." {
+		if mk_err := os.make_directory_all(dir_path, 0o755); mk_err != nil {
+			if mk_err != .Exist {
+				fmt.eprintfln("Failed to create output directory '%v': %v", dir_path, mk_err)
+				return false
+			}
+		}
+	}
+
+	output_file, open_err := os.open(path, {.Create, .Trunc, .Write}, os.Permissions_Default_File)
 	if open_err != nil {
-		fmt.eprintfln("Failed to open output file for writing: %v", open_err)
-		os.exit(1)
+		fmt.eprintfln("Failed to open output file '%v': %v", path, open_err)
+		return false
 	}
 	defer os.close(output_file)
 
 	emit_protocol(output_file, protocol, package_name)
+	return true
 }
 
 parse_protocol :: proc(doc: ^xml.Document) -> (protocol: ^Protocol, ok: bool) {
@@ -185,9 +375,699 @@ parse_protocol :: proc(doc: ^xml.Document) -> (protocol: ^Protocol, ok: bool) {
 		return
 	}
 
-	finalize_protocol(protocol) or_return
-
 	return protocol, true
+}
+
+collect_registry_sources :: proc(
+	registry_xml: []string,
+	registry_dir: []string,
+	import_base: string,
+) -> (
+	sources: [dynamic]Registry_Source,
+	ok: bool,
+) {
+	source_index := make(map[string]int)
+
+	for xml_path in registry_xml {
+		abs_path, abs_err := os.get_absolute_path(xml_path, context.temp_allocator)
+		if abs_err != nil {
+			fmt.eprintfln("Failed to resolve registry XML path '%v': %v", xml_path, abs_err)
+			return
+		}
+
+		path_clone, path_ok := clone_string_or_report(abs_path, "registry XML path")
+		if !path_ok {
+			return
+		}
+		import_path := derive_import_path_for_registry_xml(abs_path, import_base)
+		import_clone, import_ok := clone_string_or_report(import_path, "registry import path")
+		if !import_ok {
+			return
+		}
+
+		add_registry_source(&sources, &source_index, path_clone, import_clone) or_return
+	}
+
+	for dir_path in registry_dir {
+		dir_sources, dir_ok := collect_xml_files_from_directory(dir_path, import_base)
+		if !dir_ok {
+			return
+		}
+
+		for source in dir_sources {
+			add_registry_source(
+				&sources,
+				&source_index,
+				source.xml_path,
+				source.import_path,
+			) or_return
+		}
+	}
+
+	sort_registry_source :: proc(a, b: Registry_Source) -> slice.Ordering {
+		if a.xml_path != b.xml_path {
+			return slice.cmp(a.xml_path, b.xml_path)
+		}
+		return slice.cmp(a.import_path, b.import_path)
+	}
+
+	slice.sort_by_cmp(sources[:], sort_registry_source)
+
+	return sources, true
+}
+
+add_registry_source :: proc(
+	sources: ^[dynamic]Registry_Source,
+	source_index: ^map[string]int,
+	xml_path: string,
+	import_path: string,
+) -> bool {
+	if existing_index, exists := source_index^[xml_path]; exists {
+		existing := sources^[existing_index]
+		if existing.import_path != "" && import_path != "" && existing.import_path != import_path {
+			fmt.eprintfln(
+				"Conflicting import paths for registry XML '%v': '%v' vs '%v'.",
+				xml_path,
+				existing.import_path,
+				import_path,
+			)
+			return false
+		}
+		if existing.import_path == "" && import_path != "" {
+			sources^[existing_index].import_path = import_path
+		}
+		return true
+	}
+
+	append(sources, Registry_Source{xml_path = xml_path, import_path = import_path})
+	source_index^[xml_path] = len(sources^) - 1
+	return true
+}
+
+collect_xml_files_from_directory :: proc(
+	dir_path: string,
+	import_base: string,
+) -> (
+	sources: [dynamic]Registry_Source,
+	ok: bool,
+) {
+	abs_dir, abs_err := os.get_absolute_path(dir_path, context.temp_allocator)
+	if abs_err != nil {
+		fmt.eprintfln("Failed to resolve registry directory '%v': %v", dir_path, abs_err)
+		return
+	}
+
+	walker := os.walker_create(abs_dir)
+	defer os.walker_destroy(&walker)
+
+	for info in os.walker_walk(&walker) {
+		if path, err := os.walker_error(&walker); err != nil {
+			fmt.eprintfln("Failed while scanning registry directory '%v': %v", path, err)
+			return
+		}
+		if info.type != .Regular || !strings.has_suffix(info.name, ".xml") {
+			continue
+		}
+
+		relative_path, relative_err := os.get_relative_path(
+			abs_dir,
+			info.fullpath,
+			context.temp_allocator,
+		)
+		if relative_err != nil {
+			fmt.eprintfln(
+				"Failed to compute relative path for '%v' in registry directory '%v': %v",
+				info.fullpath,
+				abs_dir,
+				relative_err,
+			)
+			return
+		}
+
+		xml_clone, xml_ok := clone_string_or_report(info.fullpath, "registry XML path")
+		if !xml_ok {
+			return
+		}
+		import_path := import_path_from_registry_relative(import_base, relative_path)
+		import_clone, import_ok := clone_string_or_report(import_path, "registry import path")
+		if !import_ok {
+			return
+		}
+
+		append(&sources, Registry_Source{xml_path = xml_clone, import_path = import_clone})
+	}
+
+	if path, err := os.walker_error(&walker); err != nil {
+		fmt.eprintfln("Failed while scanning registry directory '%v': %v", path, err)
+		return
+	}
+
+	return sources, true
+}
+
+import_path_from_registry_relative :: proc(import_base: string, relative_path: string) -> string {
+	clean_relative := normalize_import_segment(relative_path)
+	dir, _ := os.split_path(clean_relative)
+	if dir == "" || dir == "." {
+		return import_base
+	}
+	if dir[len(dir) - 1] == '/' {
+		dir = dir[:len(dir) - 1]
+	}
+	return fmt.aprintf("%v/%v", import_base, dir)
+}
+
+derive_import_path_for_registry_xml :: proc(xml_path: string, import_base: string) -> string {
+	clean_path := normalize_import_segment(xml_path)
+	_, file_name := os.split_path(clean_path)
+	if file_name == "wayland.xml" {
+		return import_base
+	}
+
+	protocol_class_paths := [3]string{"/stable/", "/staging/", "/unstable/"}
+	for class_path in protocol_class_paths {
+		start := strings.index(clean_path, class_path)
+		if start >= 0 {
+			relative := clean_path[start + 1:]
+			return import_path_from_registry_relative(import_base, relative)
+		}
+	}
+
+	if strings.has_prefix(clean_path, "stable/") ||
+	   strings.has_prefix(clean_path, "staging/") ||
+	   strings.has_prefix(clean_path, "unstable/") {
+		return import_path_from_registry_relative(import_base, clean_path)
+	}
+
+	return ""
+}
+
+normalize_import_segment :: proc(raw: string) -> string {
+	normalized := raw
+	if strings.contains_rune(normalized, '\\') {
+		normalized, _ = strings.replace_all(normalized, "\\", "/")
+	}
+	return normalized
+}
+
+clone_string_or_report :: proc(raw: string, label: string) -> (cloned: string, ok: bool) {
+	alloc_err: runtime.Allocator_Error
+	cloned, alloc_err = strings.clone(raw)
+	if alloc_err != nil {
+		fmt.eprintfln("Failed to allocate %v: %v", label, alloc_err)
+		return "", false
+	}
+	return cloned, true
+}
+
+build_interface_registry :: proc(
+	sources: []Registry_Source,
+) -> (
+	registry: Interface_Registry,
+	ok: bool,
+) {
+	registry.owners = make(map[string][dynamic]Interface_Owner)
+	registry.protocols_by_path = make(map[string]Protocol_Metadata)
+	if len(sources) == 0 {
+		return registry, true
+	}
+
+	protocols: [dynamic]Protocol_Metadata
+	for source in sources {
+		metadata, metadata_ok := parse_protocol_metadata_from_source(source)
+		if !metadata_ok {
+			return
+		}
+		append(&protocols, metadata)
+	}
+
+	assign_protocol_aliases(protocols[:]) or_return
+
+	for protocol in protocols {
+		registry.protocols_by_path[protocol.xml_path] = protocol
+	}
+
+	for protocol in protocols {
+		for interface_name in protocol.interface_names {
+			owner := Interface_Owner {
+				full_interface_name = interface_name,
+				protocol_name       = protocol.name,
+				import_path         = protocol.import_path,
+				module_name         = protocol.module_name,
+				alias               = protocol.alias,
+				short_name          = short_interface_name(interface_name),
+				xml_path            = protocol.xml_path,
+			}
+
+			owners := registry.owners[owner.full_interface_name]
+			append(&owners, owner)
+			registry.owners[owner.full_interface_name] = owners
+		}
+	}
+
+	sort_owners :: proc(a, b: Interface_Owner) -> slice.Ordering {
+		if a.import_path != b.import_path {
+			return slice.cmp(a.import_path, b.import_path)
+		}
+		if a.protocol_name != b.protocol_name {
+			return slice.cmp(a.protocol_name, b.protocol_name)
+		}
+		return slice.cmp(a.xml_path, b.xml_path)
+	}
+
+	for interface_name, owners in registry.owners {
+		if len(owners) <= 1 {
+			continue
+		}
+		slice.sort_by_cmp(owners[:], sort_owners)
+		registry.owners[interface_name] = owners
+	}
+
+	return registry, true
+}
+
+normalize_protocol_import_name :: proc(raw: string) -> string {
+	if raw == "" {
+		return ""
+	}
+
+	normalized := strings.to_lower(strings.trim_space(raw))
+	if strings.contains_rune(normalized, '\\') {
+		normalized, _ = strings.replace_all(normalized, "\\", "/")
+	}
+
+	last_slash := strings.last_index_byte(normalized, '/')
+	if last_slash >= 0 && last_slash + 1 < len(normalized) {
+		normalized = normalized[last_slash + 1:]
+	}
+
+	if strings.has_suffix(normalized, ".xml") {
+		normalized = normalized[:len(normalized) - len(".xml")]
+	}
+
+	normalized, _ = strings.replace_all(normalized, "-", "_")
+	normalized, _ = strings.replace_all(normalized, ".", "_")
+	return normalized
+}
+
+parse_protocol_import_name :: proc(doc: ^xml.Document, id: xml.Element_ID) -> string {
+	import_name := get_attribute_optional(doc, id, "name")
+	if import_name != "" {
+		return import_name
+	}
+
+	interface_name := get_attribute_optional(doc, id, "interface")
+	if interface_name != "" {
+		return interface_name
+	}
+
+	return strings.trim_space(element_text(doc, id))
+}
+
+append_unique_string :: proc(values: ^[dynamic]string, value: string) {
+	if value == "" {
+		return
+	}
+	if slice.contains(values^[:], value) {
+		return
+	}
+	append(values, value)
+}
+
+parse_protocol_metadata_from_source :: proc(
+	source: Registry_Source,
+) -> (
+	metadata: Protocol_Metadata,
+	ok: bool,
+) {
+	doc, xml_err := xml.load_from_file(source.xml_path)
+	if xml_err != .None {
+		fmt.eprintfln("Failed to load registry XML file '%v': %v", source.xml_path, xml_err)
+		return
+	}
+	defer xml.destroy(doc)
+
+	if doc == nil || len(doc.elements) == 0 {
+		fmt.eprintfln("Registry XML document '%v' is empty.", source.xml_path)
+		return
+	}
+
+	root_id := xml.Element_ID(0)
+	root := doc.elements[root_id]
+	if root.kind != .Element || root.ident != "protocol" {
+		fmt.eprintfln("Registry XML root must be <protocol>: %v", source.xml_path)
+		return
+	}
+
+	protocol_name := get_attribute_required(doc, root_id, "name") or_return
+	metadata.name, ok = clone_string_or_report(protocol_name, "protocol name")
+	if !ok {
+		return
+	}
+	metadata.xml_path, ok = clone_string_or_report(source.xml_path, "registry source path")
+	if !ok {
+		return
+	}
+	metadata.import_path, ok = clone_string_or_report(source.import_path, "registry import path")
+	if !ok {
+		return
+	}
+	module_name := import_path_leaf(source.import_path)
+	metadata.module_name, ok = clone_string_or_report(module_name, "protocol module name")
+	if !ok {
+		return
+	}
+
+	for value in root.value {
+		switch child_id in value {
+		case string:
+			continue
+		case xml.Element_ID:
+			child := doc.elements[child_id]
+			if child.kind != .Element {
+				continue
+			}
+
+			switch child.ident {
+			case "interface":
+				interface_name := get_attribute_required(doc, child_id, "name") or_return
+				interface_clone, clone_ok := clone_string_or_report(
+					interface_name,
+					"interface name",
+				)
+				if !clone_ok {
+					return
+				}
+				append(&metadata.interface_names, interface_clone)
+
+			case "import":
+				import_name := normalize_protocol_import_name(
+					parse_protocol_import_name(doc, child_id),
+				)
+				if import_name == "" {
+					continue
+				}
+				import_clone, clone_ok := clone_string_or_report(
+					import_name,
+					"imported protocol name",
+				)
+				if !clone_ok {
+					return
+				}
+				append_unique_string(&metadata.imported_protocols, import_clone)
+			case:
+				continue
+			}
+		}
+	}
+
+	if len(metadata.interface_names) == 0 {
+		fmt.eprintfln("Registry XML '%v' does not define any interfaces.", source.xml_path)
+		return
+	}
+
+	return metadata, true
+}
+
+assign_protocol_aliases :: proc(protocols: []Protocol_Metadata) -> bool {
+	sort_protocols :: proc(a, b: Protocol_Metadata) -> slice.Ordering {
+		if a.import_path != b.import_path {
+			return slice.cmp(a.import_path, b.import_path)
+		}
+		if a.name != b.name {
+			return slice.cmp(a.name, b.name)
+		}
+		return slice.cmp(a.xml_path, b.xml_path)
+	}
+
+	slice.sort_by_cmp(protocols, sort_protocols)
+
+	alias_to_import := make(map[string]string)
+	for i in 0 ..< len(protocols) {
+		candidates := protocol_alias_candidates(protocols[i])
+
+		alias := ""
+		for candidate in candidates {
+			existing_import_path, exists := alias_to_import[candidate]
+			if !exists || existing_import_path == protocols[i].import_path {
+				alias = candidate
+				break
+			}
+		}
+
+		if alias == "" {
+			base := sanitize_alias(trim_version_suffix(protocols[i].name))
+			if base == "" {
+				base = "protocol"
+			}
+
+			for suffix in 2 ..< max(int) {
+				candidate := fmt.aprintf("%v_%v", base, suffix)
+				existing_import_path, exists := alias_to_import[candidate]
+				if !exists || existing_import_path == protocols[i].import_path {
+					alias = candidate
+					break
+				}
+			}
+		}
+
+		if alias == "" {
+			fmt.eprintfln(
+				"Unable to allocate import alias for registry protocol '%v' (%v).",
+				protocols[i].name,
+				protocols[i].xml_path,
+			)
+			return false
+		}
+
+		protocols[i].alias = alias
+		alias_to_import[alias] = protocols[i].import_path
+	}
+
+	return true
+}
+
+protocol_alias_candidates :: proc(protocol: Protocol_Metadata) -> (candidates: [dynamic]string) {
+	add_alias_candidate(&candidates, common_interface_alias(protocol.interface_names[:]))
+	add_alias_candidate(&candidates, trim_version_suffix(protocol.name))
+	add_alias_candidate(&candidates, import_path_leaf(protocol.import_path))
+	add_alias_candidate(&candidates, protocol.name)
+
+	base_alias := sanitize_alias(protocol.name)
+	dot_index := strings.index_byte(base_alias, '_')
+	if dot_index > 0 {
+		add_alias_candidate(&candidates, base_alias[:dot_index])
+	}
+
+	return candidates
+}
+
+add_alias_candidate :: proc(candidates: ^[dynamic]string, raw_alias: string) {
+	alias := sanitize_alias(raw_alias)
+	if alias == "" || alias == "wl" {
+		return
+	}
+	for existing in candidates^ {
+		if existing == alias {
+			return
+		}
+	}
+	append(candidates, alias)
+}
+
+sanitize_alias :: proc(raw_alias: string) -> string {
+	if raw_alias == "" {
+		return ""
+	}
+
+	bytes: [dynamic]byte
+	for ch in raw_alias {
+		if ('a' <= ch && ch <= 'z') || ('A' <= ch && ch <= 'Z') || ('0' <= ch && ch <= '9') {
+			append(&bytes, byte(ch))
+		} else {
+			append(&bytes, byte('_'))
+		}
+	}
+
+	if len(bytes) == 0 {
+		return ""
+	}
+
+	start := 0
+	for start < len(bytes) && bytes[start] == '_' {
+		start += 1
+	}
+
+	end := len(bytes)
+	for end > start && bytes[end - 1] == '_' {
+		end -= 1
+	}
+
+	if start >= end {
+		return ""
+	}
+
+	alias := string(bytes[start:end])
+	if alias[0] >= '0' && alias[0] <= '9' {
+		alias = fmt.aprintf("_%v", alias)
+	}
+	alias = strings.to_lower(alias)
+
+	clone, clone_err := strings.clone(alias)
+	if clone_err != nil {
+		return alias
+	}
+	return clone
+}
+
+common_interface_alias :: proc(interface_names: []string) -> string {
+	if len(interface_names) == 0 {
+		return ""
+	}
+
+	base_tokens := split_name_tokens(interface_names[0])
+	if len(base_tokens) == 0 {
+		return ""
+	}
+	common_count := len(base_tokens)
+
+	for interface_name in interface_names[1:] {
+		interface_tokens := split_name_tokens(interface_name)
+		limit := min(common_count, len(interface_tokens))
+
+		matched := 0
+		for matched < limit {
+			if base_tokens[matched] != interface_tokens[matched] {
+				break
+			}
+			matched += 1
+		}
+
+		common_count = matched
+		if common_count == 0 {
+			break
+		}
+	}
+
+	if common_count > 0 && is_version_token(base_tokens[common_count - 1]) {
+		common_count -= 1
+	}
+	if common_count <= 0 {
+		return ""
+	}
+
+	return join_tokens(base_tokens[:common_count], "_")
+}
+
+trim_version_suffix :: proc(raw_name: string) -> string {
+	tokens := split_name_tokens(raw_name)
+	if len(tokens) > 1 && is_version_token(tokens[len(tokens) - 1]) {
+		return join_tokens(tokens[:len(tokens) - 1], "_")
+	}
+	return raw_name
+}
+
+import_path_leaf :: proc(import_path: string) -> string {
+	normalized := normalize_import_segment(import_path)
+	last_slash := strings.last_index_byte(normalized, '/')
+	if last_slash >= 0 && last_slash + 1 < len(normalized) {
+		return normalized[last_slash + 1:]
+	}
+
+	last_colon := strings.last_index_byte(normalized, ':')
+	if last_colon >= 0 && last_colon + 1 < len(normalized) {
+		return normalized[last_colon + 1:]
+	}
+
+	return normalized
+}
+
+split_name_tokens :: proc(raw: string) -> (tokens: [dynamic]string) {
+	if raw == "" {
+		return
+	}
+
+	start := 0
+	for i := 0; i < len(raw); i += 1 {
+		if raw[i] == '_' {
+			if i > start {
+				append(&tokens, raw[start:i])
+			}
+			start = i + 1
+		}
+	}
+	if start < len(raw) {
+		append(&tokens, raw[start:])
+	}
+	return
+}
+
+join_tokens :: proc(tokens: []string, separator: string) -> string {
+	if len(tokens) == 0 {
+		return ""
+	}
+	if len(tokens) == 1 {
+		return tokens[0]
+	}
+
+	sb: strings.Builder
+	strings.builder_init(&sb)
+	defer strings.builder_destroy(&sb)
+
+	strings.write_string(&sb, tokens[0])
+	for token in tokens[1:] {
+		strings.write_string(&sb, separator)
+		strings.write_string(&sb, token)
+	}
+	joined := strings.to_string(sb)
+	clone, clone_err := strings.clone(joined)
+	if clone_err != nil {
+		return joined
+	}
+	return clone
+}
+
+is_version_token :: proc(token: string) -> bool {
+	if len(token) < 2 || token[0] != 'v' {
+		return false
+	}
+	for ch in token[1:] {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+emit_protocol_imports :: proc(ctx: ^Emit_Context, protocol: ^Protocol) {
+	if ctx.is_wayland_core {
+		return
+	}
+
+	emitln(ctx, "import \"core:c\"")
+	emitln(ctx, "import wl \"wayland:wayland\"")
+
+	if len(protocol.external_imports) > 0 {
+		aliases: [dynamic]string
+		for alias in protocol.external_imports {
+			if alias == "wl" {
+				continue
+			}
+			append(&aliases, alias)
+		}
+
+		sort_aliases :: proc(a, b: string) -> slice.Ordering {
+			return slice.cmp(a, b)
+		}
+		slice.sort_by_cmp(aliases[:], sort_aliases)
+
+		for alias in aliases {
+			import_path := protocol.external_imports[alias]
+			emitln(ctx, "import %v \"%v\"", alias, import_path)
+		}
+	}
+
+	emitln(ctx)
 }
 
 emit_protocol :: proc(
@@ -217,11 +1097,7 @@ emit_protocol :: proc(
 		emitln(&ctx)
 	}
 
-	if !ctx.is_wayland_core {
-		emitln(&ctx, "import \"core:c\"")
-		emitln(&ctx, "import wl \"wayland:wayland\"")
-		emitln(&ctx)
-	}
+	emit_protocol_imports(&ctx, protocol)
 
 	emit_interface_objects(&ctx, protocol)
 	emit_interfaces(&ctx, protocol)
@@ -516,6 +1392,13 @@ type_to_odin_type :: proc(ctx: ^Emit_Context, arg: ^Argument) -> string {
 	return ""
 }
 
+argument_name_for_odin :: proc(arg: ^Argument) -> string {
+	if arg.name_odin != "" {
+		return arg.name_odin
+	}
+	return sanitize_identifier(arg.name)
+}
+
 create_argument_text :: proc(ctx: ^Emit_Context, arg: ^Argument) -> string {
 	is_return := false
 	text := ""
@@ -545,7 +1428,7 @@ create_argument_text :: proc(ctx: ^Emit_Context, arg: ^Argument) -> string {
 	if is_return {
 		return text
 	}
-	return fmt.aprintf("%v: %v", arg.name, text)
+	return fmt.aprintf("%v: %v", argument_name_for_odin(arg), text)
 }
 
 emit_events :: proc(ctx: ^Emit_Context, interface: ^Interface) {
@@ -623,7 +1506,7 @@ emit_requests :: proc(ctx: ^Emit_Context, interface: ^Interface, protocol: ^Prot
 					emit(
 						ctx,
 						", %v: ^%v%v",
-						argument.name,
+						argument_name_for_odin(argument),
 						argument.prefix,
 						argument.interface_name_ada,
 					)
@@ -631,7 +1514,7 @@ emit_requests :: proc(ctx: ^Emit_Context, interface: ^Interface, protocol: ^Prot
 					emit(
 						ctx,
 						", %v: ^%vInterface, version: u32",
-						argument.name,
+						argument_name_for_odin(argument),
 						ctx.wayland_prefix,
 					)
 				}
@@ -653,7 +1536,7 @@ emit_requests :: proc(ctx: ^Emit_Context, interface: ^Interface, protocol: ^Prot
 						argument.enumeration_name_ada,
 					)
 				}
-				emit(ctx, ", %v: %v", argument.name, typ)
+				emit(ctx, ", %v: %v", argument_name_for_odin(argument), typ)
 			}
 		}
 		emit(ctx, ")")
@@ -697,7 +1580,7 @@ emit_requests :: proc(ctx: ^Emit_Context, interface: ^Interface, protocol: ^Prot
 					interface.name,
 				)
 			} else if has_new_id {
-				emit(ctx, ", %v, version", request.new_id_argument.name)
+				emit(ctx, ", %v, version", argument_name_for_odin(request.new_id_argument))
 			} else {
 				emit(
 					ctx,
@@ -721,12 +1604,12 @@ emit_requests :: proc(ctx: ^Emit_Context, interface: ^Interface, protocol: ^Prot
 			for argument in request.arguments {
 				if argument.type == .New_ID {
 					if argument.interface_name == "" {
-						emit(ctx, ", %v.name, version, nil", argument.name)
+						emit(ctx, ", %v.name, version, nil", argument_name_for_odin(argument))
 					} else {
 						emit(ctx, ", nil")
 					}
 				} else {
-					emit(ctx, ", %v", argument.name)
+					emit(ctx, ", %v", argument_name_for_odin(argument))
 				}
 			}
 			emitln(ctx, ")")
@@ -764,7 +1647,7 @@ emit_requests :: proc(ctx: ^Emit_Context, interface: ^Interface, protocol: ^Prot
 			}
 
 			for argument in request.arguments {
-				emit(ctx, ", %v", argument.name)
+				emit(ctx, ", %v", argument_name_for_odin(argument))
 			}
 			emitln(ctx, ")")
 		}
@@ -1270,6 +2153,7 @@ parse_argument :: proc(doc: ^xml.Document, id: xml.Element_ID) -> (argument: ^Ar
 	argument = new(Argument)
 
 	argument.name = get_attribute_required(doc, id, "name") or_return
+	argument.name_odin = sanitize_identifier(argument.name)
 
 	raw_type := get_attribute_required(doc, id, "type") or_return
 	argument.type = string_to_argument_type(raw_type) or_return
@@ -1332,12 +2216,94 @@ is_nullable_argument_type :: proc(arg_type: Argument_Type) -> bool {
 	}
 }
 
+ODIN_KEYWORDS :: []string {
+	"asm",
+	"auto_cast",
+	"bit_field",
+	"bit_set",
+	"break",
+	"case",
+	"cast",
+	"context",
+	"continue",
+	"defer",
+	"distinct",
+	"do",
+	"dynamic",
+	"else",
+	"enum",
+	"fallthrough",
+	"for",
+	"foreign",
+	"if",
+	"import",
+	"in",
+	"map",
+	"matrix",
+	"not_in",
+	"notin",
+	"or_break",
+	"or_continue",
+	"or_else",
+	"or_return",
+	"package",
+	"proc",
+	"return",
+	"struct",
+	"switch",
+	"transmute",
+	"typeid",
+	"union",
+	"using",
+	"when",
+	"where",
+}
+
 short_interface_name :: proc(full_name: string) -> string {
 	index := strings.index_byte(full_name, '_')
 	if index <= 0 || index + 1 >= len(full_name) {
 		return full_name
 	}
 	return full_name[index + 1:]
+}
+
+is_odin_keyword :: proc(identifier: string) -> bool {
+	return slice.contains(ODIN_KEYWORDS, identifier)
+}
+
+sanitize_identifier :: proc(raw: string) -> string {
+	if raw == "" {
+		return "_"
+	}
+
+	bytes: [dynamic]byte
+	for ch in raw {
+		if ('a' <= ch && ch <= 'z') ||
+		   ('A' <= ch && ch <= 'Z') ||
+		   ('0' <= ch && ch <= '9') ||
+		   ch == '_' {
+			append(&bytes, byte(ch))
+		} else {
+			append(&bytes, byte('_'))
+		}
+	}
+
+	if len(bytes) == 0 {
+		return "_"
+	}
+
+	sanitized := string(bytes[:])
+	if sanitized[0] >= '0' && sanitized[0] <= '9' {
+		sanitized = fmt.aprintf("_%v", sanitized)
+	}
+	if is_odin_keyword(sanitized) {
+		sanitized = fmt.aprintf("%v_", sanitized)
+	}
+	clone, clone_err := strings.clone(sanitized)
+	if clone_err != nil {
+		return sanitized
+	}
+	return clone
 }
 
 find_interface_by_full_name :: proc(protocol: ^Protocol, full_name: string) -> ^Interface {
@@ -1358,32 +2324,230 @@ find_enumeration_by_name :: proc(interface: ^Interface, name: string) -> ^Enumer
 	return nil
 }
 
+build_resolution_context :: proc(
+	protocol: ^Protocol,
+	registry: ^Interface_Registry,
+	source_xml_path: string,
+) -> Resolution_Context {
+	resolution_context := Resolution_Context {
+		protocol_name = protocol.name,
+		module_name   = trim_version_suffix(protocol.name),
+	}
+
+	if source_xml_path == "" {
+		return resolution_context
+	}
+
+	if metadata, ok := registry.protocols_by_path[source_xml_path]; ok {
+		resolution_context.protocol_name = metadata.name
+		resolution_context.import_path = metadata.import_path
+		resolution_context.module_name = metadata.module_name
+		resolution_context.imported_protocols = metadata.imported_protocols[:]
+	}
+
+	return resolution_context
+}
+
+owner_matches_import_name :: proc(owner: Interface_Owner, import_name: string) -> bool {
+	if import_name == "" {
+		return false
+	}
+
+	if normalize_protocol_import_name(owner.protocol_name) == import_name {
+		return true
+	}
+	if normalize_protocol_import_name(owner.module_name) == import_name {
+		return true
+	}
+	return false
+}
+
+filter_owners_by_imports :: proc(
+	owners: []Interface_Owner,
+	imported_protocols: []string,
+) -> (
+	filtered: [dynamic]Interface_Owner,
+) {
+	if len(imported_protocols) == 0 {
+		return
+	}
+
+	for owner in owners {
+		for imported_protocol in imported_protocols {
+			if owner_matches_import_name(owner, imported_protocol) {
+				append(&filtered, owner)
+				break
+			}
+		}
+	}
+
+	return
+}
+
+filter_owners_by_protocol :: proc(
+	owners: []Interface_Owner,
+	protocol_name: string,
+) -> (
+	filtered: [dynamic]Interface_Owner,
+) {
+	target := normalize_protocol_import_name(protocol_name)
+	if target == "" {
+		return
+	}
+
+	for owner in owners {
+		if normalize_protocol_import_name(owner.protocol_name) == target {
+			append(&filtered, owner)
+		}
+	}
+	return
+}
+
+filter_owners_by_module :: proc(
+	owners: []Interface_Owner,
+	module_name: string,
+) -> (
+	filtered: [dynamic]Interface_Owner,
+) {
+	target := normalize_protocol_import_name(module_name)
+	if target == "" {
+		return
+	}
+
+	for owner in owners {
+		if normalize_protocol_import_name(owner.module_name) == target {
+			append(&filtered, owner)
+		}
+	}
+	return
+}
+
+is_protocol_variant_name :: proc(protocol_name: string) -> bool {
+	normalized := normalize_protocol_import_name(protocol_name)
+	return strings.contains(normalized, "_unstable_") || strings.contains(normalized, "_staging_")
+}
+
+filter_owners_by_canonical_protocol :: proc(
+	owners: []Interface_Owner,
+) -> (
+	filtered: [dynamic]Interface_Owner,
+) {
+	for owner in owners {
+		if !is_protocol_variant_name(owner.protocol_name) {
+			append(&filtered, owner)
+		}
+	}
+	return
+}
+
+resolve_external_candidates :: proc(
+	registry: ^Interface_Registry,
+	resolution: ^Resolution_Context,
+	interface_name: string,
+) -> []Interface_Owner {
+	owners, found := registry.owners[interface_name]
+	if !found || len(owners) == 0 {
+		return nil
+	}
+
+	candidates := owners[:]
+	if len(candidates) <= 1 {
+		return candidates
+	}
+
+	import_candidates := filter_owners_by_imports(candidates, resolution.imported_protocols)
+	if len(import_candidates) == 1 {
+		return import_candidates[:]
+	}
+	if len(import_candidates) > 1 {
+		candidates = import_candidates[:]
+	}
+
+	protocol_candidates := filter_owners_by_protocol(candidates, resolution.protocol_name)
+	if len(protocol_candidates) == 1 {
+		return protocol_candidates[:]
+	}
+	if len(protocol_candidates) > 1 {
+		candidates = protocol_candidates[:]
+	}
+
+	module_candidates := filter_owners_by_module(candidates, resolution.module_name)
+	if len(module_candidates) == 1 {
+		return module_candidates[:]
+	}
+	if len(module_candidates) > 1 {
+		candidates = module_candidates[:]
+	}
+
+	canonical_candidates := filter_owners_by_canonical_protocol(candidates)
+	if len(canonical_candidates) == 1 {
+		return canonical_candidates[:]
+	}
+	if len(canonical_candidates) > 1 {
+		candidates = canonical_candidates[:]
+	}
+
+	return candidates
+}
+
 resolve_interface_reference :: proc(
 	protocol: ^Protocol,
+	registry: ^Interface_Registry,
+	resolution: ^Resolution_Context,
+	source: Reference_Source,
+	required_imports: ^map[string]string,
 	interface_name: string,
 ) -> (
 	prefix, short_name: string,
+	ok: bool,
 ) {
 	target := find_interface_by_full_name(protocol, interface_name)
 	if target != nil {
-		return "", target.name
+		return "", target.name, true
 	}
 
 	if strings.has_prefix(interface_name, "wl_") {
-		return "wl.", short_interface_name(interface_name)
+		return "wl.", short_interface_name(interface_name), true
 	}
 
-	return "", short_interface_name(interface_name)
+	candidates := resolve_external_candidates(registry, resolution, interface_name)
+	if len(candidates) == 0 {
+		report_unresolved_interface_reference(source)
+		return "", "", false
+	}
+
+	if len(candidates) > 1 {
+		report_ambiguous_interface_reference(source, candidates)
+		return "", "", false
+	}
+
+	owner := candidates[0]
+	if owner.import_path == "" {
+		fmt.eprintfln(
+			"Interface '%v' is known from '%v' but has no import path. Registry source XML path could not be mapped to an Odin package path.",
+			interface_name,
+			owner.xml_path,
+		)
+		return "", "", false
+	}
+
+	record_external_import(required_imports, owner.alias, owner.import_path, source) or_return
+	return fmt.aprintf("%v.", owner.alias), owner.short_name, true
 }
 
 resolve_enumeration_reference :: proc(
 	protocol: ^Protocol,
 	current_interface: ^Interface,
 	enum_reference: string,
+	registry: ^Interface_Registry,
+	resolution: ^Resolution_Context,
+	required_imports: ^map[string]string,
+	source: Reference_Source,
 ) -> (
 	prefix: string,
 	resolved_name: string,
 	bitfield, found: bool,
+	ok: bool,
 ) {
 	dot_index := strings.last_index_byte(enum_reference, '.')
 	if dot_index > 0 && dot_index + 1 < len(enum_reference) {
@@ -1396,44 +2560,230 @@ resolve_enumeration_reference :: proc(
 				return "wl.",
 					fmt.aprintf("%v_%v", short_interface_name(target_interface_name), enum_name),
 					false,
-					false
+					false,
+					true
 			}
 
-			// Best-effort normalization for non-local enum references.
-			return "",
-				fmt.aprintf("%v_%v", short_interface_name(target_interface_name), enum_name),
+			external_source := source
+			external_source.referenced_interface = target_interface_name
+
+			candidates := resolve_external_candidates(registry, resolution, target_interface_name)
+			if len(candidates) == 0 {
+				report_unresolved_enum_reference(source, enum_reference, target_interface_name)
+				return "", "", false, false, false
+			}
+			if len(candidates) > 1 {
+				report_ambiguous_enum_reference(
+					source,
+					enum_reference,
+					target_interface_name,
+					candidates,
+				)
+				return "", "", false, false, false
+			}
+
+			owner := candidates[0]
+			if owner.import_path == "" {
+				fmt.eprintfln(
+					"Enumeration '%v' references interface '%v' from '%v', but that protocol has no import path mapping.",
+					enum_reference,
+					target_interface_name,
+					owner.xml_path,
+				)
+				return "", "", false, false, false
+			}
+
+			record_external_import(
+				required_imports,
+				owner.alias,
+				owner.import_path,
+				external_source,
+			) or_return
+
+			return fmt.aprintf("%v.", owner.alias),
+				fmt.aprintf("%v_%v", owner.short_name, enum_name),
 				false,
-				false
+				false,
+				true
 		}
 
 		resolved_name = fmt.aprintf("%v_%v", target_interface.name, enum_name)
 		enumeration := find_enumeration_by_name(target_interface, enum_name)
 		if enumeration != nil {
-			return "", resolved_name, enumeration.bitfield, true
+			return "", resolved_name, enumeration.bitfield, true, true
 		}
-		return "", resolved_name, false, false
+		return "", resolved_name, false, false, true
 	}
 
 	resolved_name = fmt.aprintf("%v_%v", current_interface.name, enum_reference)
 	enumeration := find_enumeration_by_name(current_interface, enum_reference)
 	if enumeration != nil {
-		return "", resolved_name, enumeration.bitfield, true
+		return "", resolved_name, enumeration.bitfield, true, true
 	}
-	return "", resolved_name, false, false
+	return "", resolved_name, false, false, true
+}
+
+record_external_import :: proc(
+	required_imports: ^map[string]string,
+	alias: string,
+	import_path: string,
+	source: Reference_Source,
+) -> bool {
+	if alias == "" || import_path == "" {
+		return true
+	}
+
+	if existing_path, exists := required_imports^[alias]; exists && existing_path != import_path {
+		fmt.eprintfln(
+			"Import alias collision for '%v': '%v' vs '%v' while resolving '%v' in %v.%v.%v(%v).",
+			alias,
+			existing_path,
+			import_path,
+			source.referenced_interface,
+			source.protocol_name,
+			source.interface_full_name,
+			source.message_name,
+			source.argument_name,
+		)
+		return false
+	}
+
+	required_imports^[alias] = import_path
+	return true
+}
+
+report_unresolved_interface_reference :: proc(source: Reference_Source) {
+	fmt.eprintfln(
+		"Unresolved interface reference '%v' in protocol='%v', interface='%v', message='%v', argument='%v'. Ensure -wayland-xml and -protocols-dir include the defining XML.",
+		source.referenced_interface,
+		source.protocol_name,
+		source.interface_full_name,
+		source.message_name,
+		source.argument_name,
+	)
+}
+
+report_ambiguous_interface_reference :: proc(
+	source: Reference_Source,
+	candidates: []Interface_Owner,
+) {
+	fmt.eprintfln(
+		"Ambiguous interface reference '%v' in protocol='%v', interface='%v', message='%v', argument='%v'. Add explicit <import> in XML or reduce registry inputs. Candidates:",
+		source.referenced_interface,
+		source.protocol_name,
+		source.interface_full_name,
+		source.message_name,
+		source.argument_name,
+	)
+	for owner in candidates {
+		fmt.eprintfln(
+			"  - protocol='%v' module='%v' import='%v' xml='%v'",
+			owner.protocol_name,
+			owner.module_name,
+			owner.import_path,
+			owner.xml_path,
+		)
+	}
+}
+
+report_unresolved_enum_reference :: proc(
+	source: Reference_Source,
+	enum_reference: string,
+	target_interface_name: string,
+) {
+	fmt.eprintfln(
+		"Unresolved enum interface '%v' from enum='%v' in protocol='%v', interface='%v', message='%v', argument='%v'. Ensure -wayland-xml and -protocols-dir include the defining XML.",
+		target_interface_name,
+		enum_reference,
+		source.protocol_name,
+		source.interface_full_name,
+		source.message_name,
+		source.argument_name,
+	)
+}
+
+report_ambiguous_enum_reference :: proc(
+	source: Reference_Source,
+	enum_reference: string,
+	target_interface_name: string,
+	candidates: []Interface_Owner,
+) {
+	fmt.eprintfln(
+		"Ambiguous enum interface '%v' from enum='%v' in protocol='%v', interface='%v', message='%v', argument='%v'. Candidates:",
+		target_interface_name,
+		enum_reference,
+		source.protocol_name,
+		source.interface_full_name,
+		source.message_name,
+		source.argument_name,
+	)
+	for owner in candidates {
+		fmt.eprintfln(
+			"  - protocol='%v' module='%v' import='%v' xml='%v'",
+			owner.protocol_name,
+			owner.module_name,
+			owner.import_path,
+			owner.xml_path,
+		)
+	}
+}
+
+normalize_argument_names :: proc(message: ^Message) {
+	used := make(map[string]bool)
+
+	for argument in message.arguments {
+		base := argument.name_odin
+		if base == "" {
+			base = sanitize_identifier(argument.name)
+		}
+
+		candidate := base
+		if used[candidate] {
+			for suffix in 2 ..< max(int) {
+				next := fmt.aprintf("%v_%v", base, suffix)
+				if !used[next] {
+					candidate = next
+					break
+				}
+			}
+		}
+
+		argument.name_odin = candidate
+		used[candidate] = true
+	}
 }
 
 normalize_argument :: proc(
 	protocol: ^Protocol,
 	interface: ^Interface,
+	message: ^Message,
 	argument: ^Argument,
+	registry: ^Interface_Registry,
+	resolution: ^Resolution_Context,
+	required_imports: ^map[string]string,
 ) -> (
 	ok: bool,
 ) {
 	if argument.interface_name != "" {
-		argument.prefix, argument.interface_name = resolve_interface_reference(
+		source := Reference_Source {
+			protocol_name        = protocol.name,
+			interface_full_name  = interface.full_name,
+			message_name         = message.name,
+			argument_name        = argument.name,
+			referenced_interface = argument.interface_name,
+		}
+
+		argument.prefix, argument.interface_name, ok = resolve_interface_reference(
 			protocol,
+			registry,
+			resolution,
+			source,
+			required_imports,
 			argument.interface_name,
 		)
+		if !ok {
+			return false
+		}
 		argument.interface_name_ada = strings.to_ada_case(argument.interface_name)
 	}
 
@@ -1451,11 +2801,26 @@ normalize_argument :: proc(
 		return false
 	}
 
-	enum_prefix, resolved_name, bitfield, found := resolve_enumeration_reference(
+	source := Reference_Source {
+		protocol_name        = protocol.name,
+		interface_full_name  = interface.full_name,
+		message_name         = message.name,
+		argument_name        = argument.name,
+		referenced_interface = argument.enumeration_name,
+	}
+
+	enum_prefix, resolved_name, bitfield, found, resolved_ok := resolve_enumeration_reference(
 		protocol,
 		interface,
 		argument.enumeration_name,
+		registry,
+		resolution,
+		required_imports,
+		source,
 	)
+	if !resolved_ok {
+		return false
+	}
 
 	if found && bitfield && argument.type != .Unsigned {
 		fmt.eprintfln(
@@ -1477,20 +2842,40 @@ normalize_message :: proc(
 	protocol: ^Protocol,
 	interface: ^Interface,
 	message: ^Message,
+	registry: ^Interface_Registry,
+	resolution: ^Resolution_Context,
+	required_imports: ^map[string]string,
 ) -> (
 	ok: bool,
 ) {
+	normalize_argument_names(message)
 	message.all_null = true
 
 	if message.return_argument != nil {
-		normalize_argument(protocol, interface, message.return_argument) or_return
+		normalize_argument(
+			protocol,
+			interface,
+			message,
+			message.return_argument,
+			registry,
+			resolution,
+			required_imports,
+		) or_return
 		if message.return_argument.interface_name != "" {
 			message.all_null = false
 		}
 	}
 
 	for argument in message.arguments {
-		normalize_argument(protocol, interface, argument) or_return
+		normalize_argument(
+			protocol,
+			interface,
+			message,
+			argument,
+			registry,
+			resolution,
+			required_imports,
+		) or_return
 
 		if (argument.type == .New_ID || argument.type == .Object) &&
 		   argument.interface_name != "" {
@@ -1505,16 +2890,36 @@ normalize_message :: proc(
 	return true
 }
 
-finalize_protocol :: proc(protocol: ^Protocol) -> bool {
+finalize_protocol :: proc(
+	protocol: ^Protocol,
+	registry: ^Interface_Registry,
+	source_xml_path: string,
+) -> bool {
 	protocol.null_run_length = 0
 	protocol.type_index_counter = 0
+	protocol.external_imports = make(map[string]string)
+	resolution := build_resolution_context(protocol, registry, source_xml_path)
 
 	for interface in protocol.interfaces {
 		for request in interface.requests {
-			normalize_message(protocol, interface, request) or_return
+			normalize_message(
+				protocol,
+				interface,
+				request,
+				registry,
+				&resolution,
+				&protocol.external_imports,
+			) or_return
 		}
 		for event in interface.events {
-			normalize_message(protocol, interface, event) or_return
+			normalize_message(
+				protocol,
+				interface,
+				event,
+				registry,
+				&resolution,
+				&protocol.external_imports,
+			) or_return
 		}
 	}
 

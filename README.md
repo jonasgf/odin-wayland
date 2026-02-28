@@ -17,21 +17,15 @@ This project provides a scanner to generate Wayland client bindings for the Odin
 
 This will:
 
-- Build the scanner (default: `./wayland-scanner`).
-- Generate the core Wayland protocol in `./wayland/wayland.odin`.
+- Build the scanner (default: `wayland-scanner`).
+- Generate the core Wayland protocol in `wayland/wayland.odin`.
 - Generate all installed protocols found in
-  `wayland-protocols/(stable|staging|unstable)` into matching paths under `./wayland/`.
+  `wayland-protocols/(stable|staging|unstable)` into matching paths under `wayland/`.
 
 To use a different output directory:
 
 ```bash
 ./generate.sh /path/to/output
-```
-
-### Include as a collection in your project:
-
-```bash
-odin build -collection:wayland=/path/to/odin-wayland
 ```
 
 ### Build all bundled examples:
@@ -40,12 +34,23 @@ odin build -collection:wayland=/path/to/odin-wayland
 ./build-examples.sh
 ```
 
-Binaries are put in `./examples/bin/`.
+Binaries are put in `examples/bin/`.
+
+### Type-check all generated protocol files:
+
+```bash
+./check-protocols.sh
+```
+
+This first runs `./generate.sh`, then runs `odin check -file -no-entry-point` for every generated `.odin` protocol file.
 
 Direct scanner invocation:
 
 ```bash
-odin run scanner -- /path/to/protocol.xml /path/to/output.odin -package=my_pkg
+odin run scanner -- \
+  -output-dir=./wayland \
+  -wayland-xml=/custom/path/wayland.xml \
+  -protocols-dir=/custom/path/wayland-protocols
 ```
 
 ### Path Configuration
