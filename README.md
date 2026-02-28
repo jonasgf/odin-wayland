@@ -55,7 +55,7 @@ odin run scanner -- \
 
 ### Path Configuration
 
-Uses `pkg-config` to locate:
+By default ./generate.sh will use `pkg-config` to locate:
 
 - Core protocol: `wayland.xml` (via `wayland-scanner`).
 - Protocols directory (via `wayland-protocols`).
