@@ -2,7 +2,7 @@ package clipboard_monitor
 
 import "base:runtime"
 import "core:fmt"
-import os "core:os/os2"
+import "core:os"
 import wl "wayland:wayland"
 import ext "wayland:wayland/staging/ext-data-control"
 

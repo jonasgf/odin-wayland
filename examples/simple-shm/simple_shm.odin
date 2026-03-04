@@ -6,7 +6,6 @@ import "core:container/intrusive/list"
 import "core:flags"
 import "core:fmt"
 import "core:os"
-import "core:strings"
 import "core:sys/posix"
 import wl "wayland:wayland"
 import xdg "wayland:wayland/stable/xdg-shell"
@@ -316,7 +315,7 @@ keyboard_keymap :: proc "c" (
 	size: u32,
 ) {
 	context = runtime.default_context()
-	os.close(os.Handle(fd)) // Don’t leak the keymap fd.
+	posix.close(posix.FD(fd)) // Don’t leak the keymap fd.
 }
 
 keyboard_enter :: proc "c" (

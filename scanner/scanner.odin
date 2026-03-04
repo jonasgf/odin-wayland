@@ -4,7 +4,7 @@ import "base:runtime"
 import "core:encoding/xml"
 import "core:flags"
 import "core:fmt"
-import os "core:os/os2"
+import "core:os"
 import "core:path/filepath"
 import "core:slice"
 import "core:strings"
@@ -310,7 +310,7 @@ parse_protocol_file :: proc(path: string) -> (doc: ^xml.Document, protocol: ^Pro
 emit_protocol_to_file :: proc(path: string, protocol: ^Protocol, package_name: string) -> bool {
 	dir_path, _ := os.split_path(path)
 	if dir_path != "" && dir_path != "." {
-		if mk_err := os.make_directory_all(dir_path, 0o755); mk_err != nil {
+		if mk_err := os.make_directory_all(dir_path, os.perm(0o755)); mk_err != nil {
 			if mk_err != .Exist {
 				fmt.eprintfln("Failed to create output directory '%v': %v", dir_path, mk_err)
 				return false
@@ -567,17 +567,7 @@ relative_import_path :: proc(
 	relative_path: string,
 	ok: bool,
 ) {
-	base_os, base_new := filepath.from_slash(current_import_path)
-	if base_new {
-		defer delete(base_os)
-	}
-
-	target_os, target_new := filepath.from_slash(target_import_path)
-	if target_new {
-		defer delete(target_os)
-	}
-
-	rel_os, rel_err := filepath.rel(base_os, target_os)
+	rel_os, rel_err := filepath.rel(current_import_path, target_import_path)
 	if rel_err != .None {
 		fmt.eprintfln(
 			"Failed to compute relative import path from '%v' to '%v': %v",
@@ -589,12 +579,13 @@ relative_import_path :: proc(
 	}
 	defer delete(rel_os)
 
-	rel_slash, rel_slash_new := filepath.to_slash(rel_os)
-	if rel_slash_new {
-		defer delete(rel_slash)
+	normalized, normalize_err := filepath.replace_path_separators(rel_os, '/', context.allocator)
+	if normalize_err != nil {
+		fmt.eprintfln("Failed to normalize relative import path '%v': %v", rel_os, normalize_err)
+		return
 	}
+	defer delete(normalized)
 
-	normalized := rel_slash
 	if strings.has_suffix(normalized, "/.") && len(normalized) > 2 {
 		normalized = normalized[:len(normalized) - 2]
 	}
@@ -609,7 +600,16 @@ relative_import_path :: proc(
 normalize_import_segment :: proc(raw: string) -> string {
 	normalized := raw
 	if strings.contains_rune(normalized, '\\') {
-		normalized, _ = strings.replace_all(normalized, "\\", "/")
+		replaced, replace_err := filepath.replace_path_separators(
+			normalized,
+			'/',
+			context.allocator,
+		)
+		if replace_err != nil {
+			fmt.eprintfln("Failed to normalize path separators in '%v': %v", raw, replace_err)
+			return raw
+		}
+		normalized = replaced
 	}
 	return normalized
 }
@@ -697,7 +697,16 @@ normalize_protocol_import_name :: proc(raw: string) -> string {
 
 	normalized := strings.to_lower(strings.trim_space(raw))
 	if strings.contains_rune(normalized, '\\') {
-		normalized, _ = strings.replace_all(normalized, "\\", "/")
+		replaced, replace_err := filepath.replace_path_separators(
+			normalized,
+			'/',
+			context.allocator,
+		)
+		if replace_err != nil {
+			fmt.eprintfln("Failed to normalize protocol import path '%v': %v", raw, replace_err)
+		} else {
+			normalized = replaced
+		}
 	}
 
 	last_slash := strings.last_index_byte(normalized, '/')
