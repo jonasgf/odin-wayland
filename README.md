@@ -1,6 +1,6 @@
 # Wayland Scanner for Odin
 
-This project provides a scanner to generate Wayland client bindings for the Odin programming language.
+Generate Wayland client bindings for the Odin programming language.
 
 ## Prerequisites
 
