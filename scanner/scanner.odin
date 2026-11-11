@@ -1444,8 +1444,7 @@ argument_name_for_odin :: proc(arg: ^Argument) -> string {
 	return sanitize_identifier(arg.name)
 }
 
-create_argument_text :: proc(ctx: ^Emit_Context, arg: ^Argument) -> string {
-	is_return := false
+create_argument_text :: proc(ctx: ^Emit_Context, arg: ^Argument, is_return := false) -> string {
 	text := ""
 
 	#partial switch arg.type {
@@ -1458,7 +1457,6 @@ create_argument_text :: proc(ctx: ^Emit_Context, arg: ^Argument) -> string {
 	case .New_ID:
 		if arg.interface_name_ada != "" {
 			text = fmt.aprintf("^%v%v", arg.prefix, arg.interface_name_ada)
-			is_return = true
 		} else {
 			text = fmt.aprintf("^%vInterface, version: u32", ctx.wayland_prefix)
 		}
@@ -1498,7 +1496,7 @@ emit_events :: proc(ctx: ^Emit_Context, interface: ^Interface) {
 		emit(ctx, ")")
 
 		if event.return_argument != nil {
-			emit(ctx, " -> %v", create_argument_text(ctx, event.return_argument))
+			emit(ctx, " -> %v", create_argument_text(ctx, event.return_argument, true))
 		}
 		emitln(ctx, ",")
 	}
@@ -2162,7 +2160,9 @@ parse_message :: proc(
 
 			argument := parse_argument(doc, child_id) or_return
 
-			if argument.type == .New_ID && argument.interface_name != "" {
+			if doc.elements[id].ident == "request" &&
+			   argument.type == .New_ID &&
+			   argument.interface_name != "" {
 				if message.return_argument != nil {
 					fmt.eprintfln(
 						"Message '%v.%v' has multiple typed new_id arguments.",
