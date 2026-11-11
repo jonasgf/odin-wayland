@@ -579,7 +579,7 @@ relative_import_path :: proc(
 	}
 	defer delete(rel_os)
 
-	normalized, normalize_err := filepath.replace_path_separators(rel_os, '/', context.allocator)
+	normalized, normalize_err := filepath.replace_separators(rel_os, '/', context.allocator)
 	if normalize_err != nil {
 		fmt.eprintfln("Failed to normalize relative import path '%v': %v", rel_os, normalize_err)
 		return
@@ -600,11 +600,7 @@ relative_import_path :: proc(
 normalize_import_segment :: proc(raw: string) -> string {
 	normalized := raw
 	if strings.contains_rune(normalized, '\\') {
-		replaced, replace_err := filepath.replace_path_separators(
-			normalized,
-			'/',
-			context.allocator,
-		)
+		replaced, replace_err := filepath.replace_separators(normalized, '/', context.allocator)
 		if replace_err != nil {
 			fmt.eprintfln("Failed to normalize path separators in '%v': %v", raw, replace_err)
 			return raw
@@ -697,11 +693,7 @@ normalize_protocol_import_name :: proc(raw: string) -> string {
 
 	normalized := strings.to_lower(strings.trim_space(raw))
 	if strings.contains_rune(normalized, '\\') {
-		replaced, replace_err := filepath.replace_path_separators(
-			normalized,
-			'/',
-			context.allocator,
-		)
+		replaced, replace_err := filepath.replace_separators(normalized, '/', context.allocator)
 		if replace_err != nil {
 			fmt.eprintfln("Failed to normalize protocol import path '%v': %v", raw, replace_err)
 		} else {
